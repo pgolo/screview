@@ -6,7 +6,7 @@ import requests
 import time
 import threading
 from bs4 import BeautifulSoup
-from flask import Flask, request, Response, render_template, make_response, jsonify, logging, json, send_from_directory, redirect, abort
+from flask import Flask, request, logging, abort
 
 app = Flask(__name__)
 logger = logging.create_logger(app)
@@ -15,12 +15,21 @@ logger.root.setLevel('INFO')
 # (for the sake of an example) local kv-storage for asynk tasks
 JOBS = {}
 
+
 def try_challenge(initial_response):
+    """Handle Cloudflare challenge"""
     # not implemented
     logger.warning('Status code 503, not handled')
     return False, 'Completed, status code %s' % (initial_response.status_code), None
 
+
 def try_get_request(url, retry_on_rate_limit=True):
+    """Send GET request.
+    
+    Args:
+        str url: URL to send request to
+        bool retry_on_rate_limit: when True, if rate limit is encountered on the remote, we will wait and retry
+    """
     logger.info('Requesting %s' % (url))
     try:
         response = requests.get(url)
@@ -43,8 +52,14 @@ def try_get_request(url, retry_on_rate_limit=True):
         logger.warning('Will not retry, moving on')
     return False, 'Completed, status code %s' % (response.status_code), None
 
+
 def get_rating_distribution(soup):
-    script_child = soup.find(text=re.compile(r'^window.__ssr_data'))
+    """Locate and parse specific section of a page containg review rating distribution.
+
+    Args:
+        BeautifulSoup soup: object representing parsed HTML page
+    """
+    script_child = soup.find(string=re.compile(r'^window.__ssr_data'))
     if script_child is None:
         logger.warning('Could not find section to extract ratingDistribution from')
         return []
@@ -59,22 +74,24 @@ def get_rating_distribution(soup):
     logger.info('Extracted ratingDistribution=%s' % (str(rating_distribution)))
     return rating_distribution
 
-def get_reviews_from_page(url, retry_on_rate_limit, get_ssr_data=False):
-    total_reviews, rating_distribution, ret = 0, [], {}
-    success, response_description, response = try_get_request(url, retry_on_rate_limit)
-    if not success:
-        msg = 'Failed to load page %s' % (url)
-        logger.warning(msg)
-        return response_description, msg, total_reviews, rating_distribution, ret
-    
-    # parse response (expecting HTML page with reviews)
-    soup = BeautifulSoup(response.text, 'html.parser')
+
+def parse_html(html, get_ssr_data, url, response_description):
+    """Parse HTML content (supposedly returned as some response.text)
+
+    Args:
+        str html: text to parse (expecting HTML page with reviews)
+        bool get_ssr_data: when True, specific part of the page containing review rating distribution will be parsed as well
+        str url: URL from where HTML was originally retrieved
+        str response_description: message from helper function that was sending HTTP request
+    """
+    total_reviews, rating_distribution, reviews = 0, [], {}
+    soup = BeautifulSoup(html, 'html.parser')
     content_element = soup.find(name='script', attrs={'data-react-helmet': 'true'})
     
     if content_element is None: # page is likely invalid
         msg = 'Page is invalid: %s' % (url)
         logger.warning(msg)
-        return response_description, msg, total_reviews, rating_distribution, ret
+        return response_description, msg, total_reviews, rating_distribution, reviews
     
     if get_ssr_data:
         rating_distribution = get_rating_distribution(soup)
@@ -83,17 +100,42 @@ def get_reviews_from_page(url, retry_on_rate_limit, get_ssr_data=False):
     if 'aggregateRating' not in content: # page is likely invalid
         msg = 'Page is invalid: %s' % (url)
         logger.warning(msg)
-        return response_description, msg, total_reviews, rating_distribution, ret
+        return response_description, msg, total_reviews, rating_distribution, reviews
 
     total_reviews = content['aggregateRating']['reviewCount']
     if total_reviews > 0 and 'review' in content:
         for review in content['review']:
-            ret[review['url']] = {'title': review['headline'], 'content': review['reviewBody'], 'author_name': review['author']['name'], 'author_uri': review['author']['sameAs'], 'rating': review['reviewRating']['ratingValue'], 'date': review['datePublished']}
-    msg = 'Page %s: reviewCount=%d; extracted from page: %d' % (url, total_reviews, len(ret))
+            reviews[review['url']] = {'title': review['headline'], 'content': review['reviewBody'], 'author_name': review['author']['name'], 'author_uri': review['author']['sameAs'], 'rating': review['reviewRating']['ratingValue'], 'date': review['datePublished']}
+    msg = 'Page %s: reviewCount=%d; extracted from page: %d' % (url, total_reviews, len(reviews))
     logger.info(msg)
-    return response_description, msg, total_reviews, rating_distribution, ret
+    return response_description, msg, total_reviews, rating_distribution, reviews
+
+
+def get_reviews_from_page(url, retry_on_rate_limit, get_ssr_data=False):
+    """Request single page and parse it.
+    
+    Args:
+        str url: URL of the page to parse
+        bool retry_on_rate_limit: when True, if rate limit is encountered on the remote, we will wait and retry
+        bool get_ssr_data: when True, specific part of the page containing review rating distribution will be parsed as well
+    """
+    success, response_description, response = try_get_request(url, retry_on_rate_limit)
+    if not success:
+        msg = 'Failed to load page %s' % (url)
+        logger.warning(msg)
+        return response_description, msg, 0, [], {}    
+    return parse_html(response.text, get_ssr_data, url, response_description)
+
 
 def page_url(base_url, star_rating, page_number, sort_by_oldest=False):
+    """Construct URL using provided parameters.
+    
+    Args:
+        str base_url: URL stripped of any parameters
+        int star_rating: review rating
+        int page_number: page number
+        bool sort_by_oldest: when True, sort reviews 'oldest to newest' first before retrieving a page
+    """
     if sort_by_oldest:
         url = '%s?sortBy=oldest&rating=%d' % (base_url, star_rating)
     else:
@@ -103,15 +145,24 @@ def page_url(base_url, star_rating, page_number, sort_by_oldest=False):
     logger.info('Will request rating=%d, page=%d, ordered %s first (%s)' % (star_rating, page_number, 'oldest' if sort_by_oldest else 'newest', url))
     return url
 
-def get_reviews(url, crawl=False, sort_by_oldest=False, retry_on_rate_limit=False):
+
+def get_reviews(url, crawl=False, sort_by_oldest=False, retry_on_rate_limit=False, page_limit=0):
+    """Process one or more pages starting with specified URL and return collected reviews.
+    
+    Args:
+        str url: URL to process
+        bool crawl: when True and there are more reviews than fit single page, other pages with same base URL will be processed as well
+        bool sort_by_oldest: when True, additional pages will be loaded when reviews are sorted 'oldest to newest'
+        bool retry_on_rate_limit: when True, if rate limit is encountered on the remote, we will wait and retry
+    """
     # get first page and check if we have all the reviews with one shot
     last_response_description, last_msg, total_reviews, rating_distribution, reviews = get_reviews_from_page(url, retry_on_rate_limit, get_ssr_data=True)
     if total_reviews == 0:
         logger.warning('Did not get any reviews from requested page')
-        return last_response_description, last_msg, reviews
+        return {'http_response': last_response_description, 'job_status': last_msg, 'data': reviews}
     elif total_reviews == len(reviews) or not crawl:
         logger.info('%s' % ('Got all reviews in one go' if crawl else 'Got reviews from requested page (will not look further)'))
-        return last_response_description, last_msg, reviews
+        return {'http_response': last_response_description, 'job_status': last_msg, 'data': reviews}
     logger.info('Reviews take more than 1 page, will try crawling')
     # stratify by star rating, then by page number
     if not rating_distribution:
@@ -128,9 +179,9 @@ def get_reviews(url, crawl=False, sort_by_oldest=False, retry_on_rate_limit=Fals
             continue
         logger.info('Star rating %d: expecting %d page%s' % (star_rating, expected_pages_count, 's' if expected_pages_count != 1 else ''))
         for page_number in range(1, expected_pages_count+1):
-            #if page_number >= 10:
-            #    logger.warning('Will not process pages number 10 and higher')
-            #    break
+            if page_limit > 0 and page_number > page_limit:
+                logger.warning('Will not process pages beyond page %d' % page_limit)
+                break
             next_url = page_url(base_url, star_rating, page_number, sort_by_oldest)
             try:
                 last_response_description, last_msg, _, _, got_reviews = get_reviews_from_page(next_url, retry_on_rate_limit)
@@ -140,78 +191,67 @@ def get_reviews(url, crawl=False, sort_by_oldest=False, retry_on_rate_limit=Fals
             reviews.update(got_reviews)
             logger.info('Total reviews collected so far: %d (%s)' % (len(reviews), url))
     logger.info('Got %d reviews from %s' % (len(reviews), url))
-    return last_response_description, last_msg, reviews
+    return {'http_response': last_response_description, 'job_status': last_msg, 'data': reviews}
+
+
+def run_job(job_id, method, *args, **kwargs):
+    """Wrap get_reviews() function in a job.
+
+    Args:
+        str job_id: ID of a job to store
+        object method: procedure to execute (expected to return iterable with at least 3 items)
+        *args, **kwargs: parameters for method
+    """
+    global JOBS
+    JOBS[job_id] = {'http_response': 'N/A', 'job_status': 'In progress', 'data': {}}
+    result = method(*args, **kwargs)
+    JOBS[job_id] = result
+
 
 # Views
 
-def get_reviews_async(url, crawl, sort_by_oldest, retry_on_rate_limit, job_id):
-    global JOBS
-    JOBS[job_id] = {'http_response': 'N/A', 'job_status': 'In progress', 'data': {}}
-    result = get_reviews(url=url, crawl=crawl, sort_by_oldest=sort_by_oldest, retry_on_rate_limit=retry_on_rate_limit)
-    JOBS[job_id] = {'http_response': result[0], 'job_status': result[1], 'data': result[2]}
-
 @app.route('/', methods=['GET', 'POST'])
 def scrape():
+    """Get parameters and either parse single page right away and return the results,
+    or start job in a separate thread and return endpoint to retrieve the results later.
+    """
     global JOBS
     if request.method == 'GET':
         # parse single page
         url = request.args['url']
         result = get_reviews(url=url)
-        return {'http_response': result[0], 'job_status': result[1], 'data': result[2]}
+        return result
     elif request.method == 'POST':
-        # promise to parse what is requested
+        # promise to parse what is requested, and execute in a separate thread
         url = request.args['url']
         crawl = request.args['crawl'].lower() == 'true' if 'crawl' in request.args else False
         sort_oldest_first = request.args['oldest_first'].lower() == 'true' if 'oldest_first' in request.args else False
         retry_on_rate_limit = request.args['retry_on_rate_limit'].lower() == 'true' if 'retry_on_rate_limit' in request.args else False
+        page_limit = int(request.args['page_limit']) if 'page_limit' in request.args and request.args['page_limit'].isdigit() else 0
         job_id = str(datetime.datetime.timestamp(datetime.datetime.now()))
         JOBS[job_id] = {'http_response': 'N/A', 'job_status': 'Requested', 'data': {}}
-        t = threading.Thread(target=get_reviews_async, args=(url, crawl, sort_oldest_first, retry_on_rate_limit, job_id))
+        t = threading.Thread(target=run_job, args=(job_id, get_reviews, url, crawl, sort_oldest_first, retry_on_rate_limit, page_limit))
         t.run()
         return {'fetch_results_at': '/result?job_id=%s' % (str(job_id))}
     abort(400)
 
+
 @app.route('/jobs', methods=['GET'])
 def result():
+    """Return list of async jobs"""
     global JOBS
     return {'jobs': list(JOBS.keys())}
 
+
 @app.route('/result', methods=['GET'])
 def jobs():
+    """Return result of a job done asynchronously"""
     global JOBS
     job_id = request.args['job_id']
     if job_id in JOBS:
         return JOBS[job_id]
     abort(400)
 
-"""
-@app.route('/', methods=['GET', 'POST'])
-def scrape():
-    if request.method == 'GET':
-        url = request.args['url']
-        result = get_reviews(url=url)
-        return {'http_response': result[0], 'job_status': result[1], 'data': result[2]}
-    elif request.method == 'POST':
-        url = request.args['url']
-        crawl = request.args['crawl'].lower() == 'true' if 'crawl' in request.args else False
-        sort_oldest_first = request.args['oldest_first'].lower() == 'true' if 'oldest_first' in request.args else False
-        retry_on_rate_limit = request.args['retry_on_rate_limit'].lower() == 'true' if 'retry_on_rate_limit' in request.args else False
-        result = get_reviews(url=url, crawl=crawl, sort_by_oldest=sort_oldest_first, retry_on_rate_limit=retry_on_rate_limit)
-        return {'http_response': result[0], 'job_status': result[1], 'data': result[2]}
-    # neither GET, not POST
-    abort(400)
-"""
 
 if __name__ == '__main__':
     app.run(port=5000)
-
-
-
-#rrr = get_reviews('https://www.productreview.com.au/listings/hotondo-homes')
-#get_reviews_from_page('https://www.productreview.com.au/listings/birde-console-bc800?rating=2')
-#get_reviews('https://www.productreview.com.au/listings/birde-console-bc800')
-#rrr = get_reviews('https://www.productreview.com.au/listings/hotondo-homes')
-#rrr = get_reviews('https://www.productreview.com.au/listings/birde-console-bc800?rating=5')
-#rrr = get_reviews('http://werwet')
-#rrr = get_reviews(None)
-#print(len(rrr))
