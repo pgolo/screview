@@ -154,6 +154,7 @@ def get_reviews(url, crawl=False, sort_by_oldest=False, retry_on_rate_limit=Fals
         bool crawl: when True and there are more reviews than fit single page, other pages with same base URL will be processed as well
         bool sort_by_oldest: when True, additional pages will be loaded when reviews are sorted 'oldest to newest'
         bool retry_on_rate_limit: when True, if rate limit is encountered on the remote, we will wait and retry
+        int page_limit: when >= 0, limit number of requested pages per each star rating to this number
     """
     # get first page and check if we have all the reviews with one shot
     last_response_description, last_msg, total_reviews, rating_distribution, reviews = get_reviews_from_page(url, retry_on_rate_limit, get_ssr_data=True)
