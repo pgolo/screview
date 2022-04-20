@@ -63,11 +63,12 @@ def get_rating_distribution(soup):
     if script_child is None:
         logger.warning('Could not find section to extract ratingDistribution from')
         return []
-    script_element = script_child.parent
-    script_text = script_element.text[19:-2].replace('\\\\n', '\n').replace('\\\\', '$backslash').replace('\\', '').replace('$backslash', '\\')
+    script_text = str(script_child)
+    ssr_data_statement = script_text[script_text.find("window.__ssr_data='"):script_text.find("}';", script_text.find("window.__ssr_data='"))+2]
+    ssr_data = ssr_data_statement[19:-1].replace('\\\\n', '\n').replace('\\\\', '$backslash').replace('\\', '').replace('$backslash', '\\')
     try:
-        script_json = json.loads(script_text, strict=False)
-        rating_distribution = script_json['reduxAsyncConnect']['itemsMap']['listingPageAsyncDataContainer']['data']['listing']['statistics']['ratingDistribution']
+        ssr_json = json.loads(ssr_data, strict=False)
+        rating_distribution = ssr_json['reduxAsyncConnect']['itemsMap']['listingPageAsyncDataContainer']['data']['listing']['statistics']['ratingDistribution']
     except:
         logger.warning('Found relevant section, but could not extract ratingDistribution')
         return []
