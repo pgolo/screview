@@ -6,7 +6,8 @@ import requests
 import time
 import threading
 from bs4 import BeautifulSoup
-from flask import Flask, request, logging, abort
+from flask import Flask, request, logging, abort, Response
+import werkzeug.exceptions
 
 app = Flask(__name__)
 logger = logging.create_logger(app)
@@ -224,17 +225,35 @@ def scrape():
         return result
     elif request.method == 'POST':
         # promise to parse what is requested, and execute in a separate thread
-        url = request.args['url']
-        crawl = request.args['crawl'].lower() == 'true' if 'crawl' in request.args else False
-        sort_oldest_first = request.args['oldest_first'].lower() == 'true' if 'oldest_first' in request.args else False
-        retry_on_rate_limit = request.args['retry_on_rate_limit'].lower() == 'true' if 'retry_on_rate_limit' in request.args else False
-        page_limit = int(request.args['page_limit']) if 'page_limit' in request.args and request.args['page_limit'].isdigit() else 0
+        parameters = {}
+        try:
+            parameters = request.get_json()
+        except werkzeug.exceptions.BadRequest:
+            return Response("{'status_code': '400', 'message': 'request parameters have not been provided'}", status=400, mimetype='application/json')
+        
+        url = parameters['url'] if 'url' in parameters else None
+        crawl = parameters['crawl'].lower() == 'true' if 'crawl' in parameters else False
+        sort_oldest_first = parameters['oldest_first'].lower() == 'true' if 'oldest_first' in parameters else False
+        retry_on_rate_limit = parameters['retry_on_rate_limit'].lower() == 'true' if 'retry_on_rate_limit' in parameters else False
+        page_limit = int(parameters['page_limit']) if 'page_limit' in parameters and parameters['page_limit'].isdigit() else 0
+
+        if url is None:
+            return Response("{'status_code': '400', 'message': 'remote URL has not been provided'}", status=400, mimetype='application/json')
+
+        if not url.startswith('https://www.productreview.com.au/listings/'):
+            return Response("{'status_code': '400', 'message': 'remote URL is invalid'}", status=400, mimetype='application/json')
+            
+        # url = request.args['url']
+        # crawl = request.args['crawl'].lower() == 'true' if 'crawl' in request.args else False
+        # sort_oldest_first = request.args['oldest_first'].lower() == 'true' if 'oldest_first' in request.args else False
+        # retry_on_rate_limit = request.args['retry_on_rate_limit'].lower() == 'true' if 'retry_on_rate_limit' in request.args else False
+        # page_limit = int(request.args['page_limit']) if 'page_limit' in request.args and request.args['page_limit'].isdigit() else 0
         job_id = str(datetime.datetime.timestamp(datetime.datetime.now()))
         JOBS[job_id] = {'http_response': 'N/A', 'job_status': 'Requested', 'data': {}}
         t = threading.Thread(target=run_job, args=(job_id, get_reviews, url, crawl, sort_oldest_first, retry_on_rate_limit, page_limit))
         t.run()
         return {'fetch_results_at': '/result?job_id=%s' % (str(job_id))}
-    abort(400)
+    #abort(400)
 
 
 @app.route('/jobs', methods=['GET'])
