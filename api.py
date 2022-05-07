@@ -244,17 +244,12 @@ def scrape():
         if not url.startswith('https://www.productreview.com.au/listings/'):
             return Response("{'status_code': '400', 'message': 'remote URL is invalid'}", status=400, mimetype='application/json')
             
-        # url = request.args['url']
-        # crawl = request.args['crawl'].lower() == 'true' if 'crawl' in request.args else False
-        # sort_oldest_first = request.args['oldest_first'].lower() == 'true' if 'oldest_first' in request.args else False
-        # retry_on_rate_limit = request.args['retry_on_rate_limit'].lower() == 'true' if 'retry_on_rate_limit' in request.args else False
-        # page_limit = int(request.args['page_limit']) if 'page_limit' in request.args and request.args['page_limit'].isdigit() else 0
         job_id = str(datetime.datetime.timestamp(datetime.datetime.now()))
         JOBS[job_id] = {'http_response': 'N/A', 'job_status': 'Requested', 'data': {}}
         t = threading.Thread(target=run_job, args=(job_id, get_reviews, url, crawl, sort_oldest_first, retry_on_rate_limit, page_limit))
         t.run()
         return {'fetch_results_at': '/result?job_id=%s' % (str(job_id))}
-    #abort(400)
+    abort(400)
 
 
 @app.route('/jobs', methods=['GET'])
